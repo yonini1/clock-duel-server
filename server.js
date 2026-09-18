@@ -3,19 +3,23 @@
 // Backend-сервер игры "Дуэль часов".
 // Сам он только принимает подключения и передаёт сообщения —
 // все правила игры живут в game.js (Server-authoritative logic).
+// Этот файл также отвечает за reconnection (переподключение).
 // ---------------------------------------------------------------
 
 const http = require('http');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const {
   createRoomState,
   startRound,
+  startTurn,
   handleConfirm,
   resetMatch,
   otherColor
 } = require('./game');
 
 const PORT = process.env.PORT || 3000;
+const RECONNECT_GRACE_MS = 45000; // 45 секунд на переподключение, прежде чем считать игрока выбывшим
 const rooms = new Map();
 
 function makeRoomCode() {
@@ -46,6 +50,13 @@ function makeIo(room) {
   };
 }
 
+function deleteRoom(room) {
+  clearTimeout(room.turnTimeout);
+  clearTimeout(room.disconnectTimers.red);
+  clearTimeout(room.disconnectTimers.blue);
+  rooms.delete(room.code);
+}
+
 const httpServer = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Clock duel server is running.');
@@ -69,13 +80,17 @@ wss.on('connection', (ws) => {
       const code = makeRoomCode();
       const room = createRoomState(code);
       room.sockets = { red: null, blue: null };
+      room.tokens = { red: null, blue: null };
+      room.disconnectTimers = { red: null, blue: null };
       const color = Math.random() < 0.5 ? 'red' : 'blue';
+      const token = crypto.randomUUID();
       room.sockets[color] = ws;
+      room.tokens[color] = token;
       rooms.set(code, room);
 
       ws.roomCode = code;
       ws.color = color;
-      send(ws, { type: 'created', code, color });
+      send(ws, { type: 'created', code, color, token });
       return;
     }
 
@@ -91,14 +106,50 @@ wss.on('connection', (ws) => {
       }
       const takenColor = room.sockets.red ? 'red' : 'blue';
       const myColor = otherColor(takenColor);
+      const token = crypto.randomUUID();
       room.sockets[myColor] = ws;
+      room.tokens[myColor] = token;
       ws.roomCode = room.code;
       ws.color = myColor;
 
-      send(ws, { type: 'joined', code: room.code, color: myColor });
+      send(ws, { type: 'joined', code: room.code, color: myColor, token });
       send(room.sockets[takenColor], { type: 'opponent_joined' });
 
       startRound(room, makeIo(room));
+      return;
+    }
+
+    if (msg.type === 'rejoin') {
+      const room = rooms.get(String(msg.code || '').trim());
+      if (!room) {
+        send(ws, { type: 'room_gone' });
+        return;
+      }
+      const color = room.tokens.red === msg.token ? 'red' : room.tokens.blue === msg.token ? 'blue' : null;
+      if (!color) {
+        send(ws, { type: 'room_gone' });
+        return;
+      }
+
+      clearTimeout(room.disconnectTimers[color]);
+      room.disconnectTimers[color] = null;
+      room.sockets[color] = ws;
+      ws.roomCode = room.code;
+      ws.color = color;
+
+      send(ws, { type: 'rejoined', code: room.code, color });
+      send(room.sockets[otherColor(color)], { type: 'opponent_reconnected' });
+
+      if (room.secretHour === null) {
+        // Матч ещё не начался (второй игрок ещё не подключался) —
+        // просто возвращаем в экран ожидания, а не в игру.
+        return;
+      }
+
+      const io = makeIo(room);
+      // Перезапускаем именно текущий ход (не весь раунд), чтобы не
+      // потерять уже сделанный ход второго игрока в этом раунде.
+      startTurn(room, io);
       return;
     }
 
@@ -122,13 +173,29 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     const room = rooms.get(ws.roomCode);
-    if (!room) return;
-    send(room.sockets[otherColor(ws.color)], { type: 'opponent_disconnected' });
-    clearTimeout(room.turnTimeout);
-    rooms.delete(room.code);
+    if (!room || room.sockets[ws.color] !== ws) return; // это старый, уже заменённый сокет — игнорируем
+
+    const color = ws.color;
+    room.sockets[color] = null;
+    clearTimeout(room.turnTimeout); // ставим игру на паузу, пока игрок не вернётся
+
+    const opponentSocket = room.sockets[otherColor(color)];
+    if (!opponentSocket) {
+      // Оба отключились — комнату можно сразу убрать.
+      deleteRoom(room);
+      return;
+    }
+
+    send(opponentSocket, { type: 'opponent_disconnected', graceSeconds: RECONNECT_GRACE_MS / 1000 });
+
+    room.disconnectTimers[color] = setTimeout(() => {
+      send(room.sockets[otherColor(color)], { type: 'opponent_left' });
+      deleteRoom(room);
+    }, RECONNECT_GRACE_MS);
   });
 });
 
 httpServer.listen(PORT, () => {
   console.log('Clock duel server listening on port ' + PORT);
 });
+    
