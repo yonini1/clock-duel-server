@@ -107,3 +107,4 @@ function resetMatch(room, io) {
 }
 
 module.exports = { createRoomState, startRound, startTurn, handleConfirm, evaluateRound, resetMatch, otherColor, randomHour };
+      
